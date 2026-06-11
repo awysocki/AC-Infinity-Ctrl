@@ -1,0 +1,36 @@
+Here is the complete wiring diagram mapping out exactly how the components connect inside your box.
+[  USB-C BREAKOUT BOARD  ]
+   ├── VBUS (10V) ──────────────────────────► [ MPM3610 INPUT: IN ]
+   ├── GND ────────┬────────────────────────► [ MPM3610 INPUT: GND ]
+   │               │
+   ├── D+ (PWM) ───┼───────────┐
+   └── D- (TACH) ──┼───────────┼───────┐
+                   │           │       │
+                   │           │       │
+[ MPM3610 BUCK CONVERTER ]     │       │
+   ├── OUT (5V) ───┼───────────┼───────┼───────► [ ADAFRUIT 5691: 5V PIN ]
+   └── GND ────────┼───────────┼───────┼───────► [ ADAFRUIT 5691: GND PIN ]
+                   │           │       │
+                   ▼           │       │
+             ┌───────────┐     │       │
+             │  BS170    │     │       │`
+             │ MOSFET    │     │       │
+             │ TRANSISTOR│     │       │
+             └─────┬─────┘     │       │
+    Pin 1 (Source) ┴           │       │
+    Pin 3 (Drain) ◄────────────┘       │
+    Pin 2 (Gate) ◄─────────────────────┼───────── [ ADAFRUIT 5691: GPIO 12 ]
+                                       │
+                                       └────────► [ ADAFRUIT 5691: GPIO 13 ]
+
+
+The Three Isolated Circuits Inside the Box
+To make this easy to visualize, think of the box as having three distinct sections handling different jobs:
+1. The Power Drop (Top Section)
+The fan sends 10V into the box on the VBUS wire. The MPM3610 Buck Regulator catches that 10V, steps it down cleanly like a miniature transformer, and pushes out a safe 5V supply to the Adafruit board's power pin.
+2. The Isolation Gate (Middle Section)
+The BS170 Transistor acts as a physical firewall. The right pin (Drain) connects to the fan's high-voltage 10V speed wire (D+). The left pin (Source) connects to Ground. They sit there completely disconnected until your board sends a tiny message.
+3. The Logic Control (Bottom Section)
+Your Adafruit 5691 board operates strictly in a low-voltage environment. When your code triggers the fan to spin, it blinks a low-power 3.3V signal out of GPIO 12 into the transistor's middle pin (Gate). The transistor instantly snaps shut, safely bridging the fan's 10V line down to Ground without ever letting that 10V signal bleed back into your microcontroller.
+
+
