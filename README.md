@@ -2,6 +2,13 @@
 
 This project controls an AC Infinity fan using an ESP32-S2 board and your external BS170 transistor circuit.
 
+Current verified pin map (your existing build):
+
+- `GPIO12` -> BS170 gate -> controls fan PWM line (`D+`)
+- `GPIO13` <- fan FG/tach line (`D-`)
+
+For tach conditioning, use your external resistor network on the tach line (no board rewiring required).
+
 ## Files
 
 - `WireDiagram.txt`: your hardware mapping

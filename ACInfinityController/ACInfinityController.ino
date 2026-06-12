@@ -3,7 +3,7 @@
 
   Wiring based on WireDiagram.txt:
   - GPIO12 -> BS170 gate (controls fan D+ sink through MOSFET)
-  - GPIO13 <- fan tach signal (D-)
+  - GPIO13 <- fan tach signal (D- / FG)
   - Board powered from 5V output of buck converter
 
   Serial commands (115200 baud):
@@ -43,7 +43,7 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // Pin and control configuration
 // -----------------------------
 static const int FAN_PWM_PIN = 12;      // Drives BS170 gate
-static const int FAN_TACH_PIN = 13;     // Reads tach pulses
+static const int FAN_TACH_PIN = 13;     // Reads tach pulses (FG)
 
 #if defined(D0)
 static const int BTN_MINUS_PIN = D0;
@@ -68,7 +68,8 @@ static const bool BTN_MINUS_ACTIVE_LOW = true;   // D0
 static const bool BTN_PRESET_ACTIVE_LOW = false; // D1
 static const bool BTN_PLUS_ACTIVE_LOW = false;   // D2
 
-static const int PWM_FREQ_HZ = 25000;   // Quiet PWM frequency (adjust if needed)
+// Match known-working ESPHome setup (~4.9 kHz on D+ line).
+static const int PWM_FREQ_HZ = 4882;
 static const int PWM_CHANNEL = 0;
 static const int PWM_RES_BITS = 10;     // 10-bit: 0..1023
 
@@ -78,12 +79,20 @@ static const int PWM_RES_BITS = 10;     // 10-bit: 0..1023
 // is backwards, set to false.
 static const bool PWM_ACTIVE_LOW_AT_FAN_LINE = true;
 
-// Some fan controllers do not like a perfect DC level at the control pin.
-// Keep 100% at 99% duty so PWM is still present.
-static const bool KEEP_PWM_PULSING_AT_MAX = true;
+// Keep this false for AC Infinity D+ control to preserve true 0..100 mapping.
+static const bool KEEP_PWM_PULSING_AT_MAX = false;
 
-// Most fans output 2 tach pulses per revolution. Change if yours differs.
-static const float TACH_PULSES_PER_REV = 2.0f;
+// Calibrated endpoints for inverted PWM mode on this fan/controller pair.
+// Lower effective % is faster. Keep top-end away from the shutdown dead-zone.
+static const int INVERTED_EFFECTIVE_AT_MAX = 12; // user 100%
+static const int INVERTED_EFFECTIVE_AT_MIN = 85; // user MIN_RUN_PERCENT
+
+// Below this point the fan may stall. Keep the output above a small floor
+// whenever the user asks for a nonzero speed.
+static const int MIN_RUN_PERCENT = 15;
+
+// AC Infinity FG line appears to output 3 pulses per revolution.
+static const float TACH_PULSES_PER_REV = 3.0f;
 // 5000 us min edge interval ~= 6000 RPM max for 2 pulses/rev.
 // This aggressively rejects high-frequency noise seen on the tach line.
 static const uint32_t TACH_MIN_EDGE_US = 5000;
@@ -102,6 +111,7 @@ int targetSpeedPercent = 40;
 uint32_t lastUiDrawMs = 0;
 int lastUiSpeed = -1;
 int lastUiRpm = -1;
+uint32_t lastUiTachCount = 0;
 
 bool minusPressedPrev = false;
 bool presetPressedPrev = false;
@@ -138,14 +148,33 @@ void IRAM_ATTR onTachPulse() {
 uint32_t percentToDuty(int percent) {
   percent = constrain(percent, 0, 100);
 
-  if (KEEP_PWM_PULSING_AT_MAX && percent >= 100) {
-    percent = 99;
-  }
-
   int effectivePercent = percent;
   if (PWM_ACTIVE_LOW_AT_FAN_LINE) {
-    effectivePercent = 100 - percent;
+    if (percent <= 0) {
+      effectivePercent = 100;
+    } else {
+      int request = percent;
+      if (request < MIN_RUN_PERCENT) {
+        request = MIN_RUN_PERCENT;
+      }
+
+      // Map user request MIN_RUN..100 to calibrated effective range.
+      const float spanReq = (float)(100 - MIN_RUN_PERCENT);
+      const float t = spanReq > 0.0f ? (float)(request - MIN_RUN_PERCENT) / spanReq : 1.0f;
+      const float eff = (float)INVERTED_EFFECTIVE_AT_MIN +
+                        ((float)(INVERTED_EFFECTIVE_AT_MAX - INVERTED_EFFECTIVE_AT_MIN) * t);
+      effectivePercent = (int)(eff + 0.5f);
+    }
+  } else if (KEEP_PWM_PULSING_AT_MAX && percent >= 100) {
+    effectivePercent = 99;
+  } else {
+    if (percent > 0 && percent < MIN_RUN_PERCENT) {
+      percent = MIN_RUN_PERCENT;
+    }
+    effectivePercent = percent;
   }
+
+  effectivePercent = constrain(effectivePercent, 0, 100);
 
   const uint32_t maxDuty = (1u << PWM_RES_BITS) - 1u;
   return (uint32_t)((effectivePercent * (int)maxDuty) / 100);
@@ -226,8 +255,15 @@ void drawStaticUi() {
 
 void updateUi(bool force) {
   const int rpmInt = (int)currentRpm;
+  uint32_t tachCountSnapshot;
+  noInterrupts();
+  tachCountSnapshot = tachPulseCount;
+  interrupts();
+
   if (!force && rpmInt == lastUiRpm && targetSpeedPercent == lastUiSpeed) {
-    return;
+    if (tachCountSnapshot == lastUiTachCount) {
+      return;
+    }
   }
 
   tft.fillRect(92, 40, 140, 18, ST77XX_BLACK);
@@ -243,8 +279,16 @@ void updateUi(bool force) {
   tft.setCursor(70, 66);
   tft.print(rpmInt);
 
+  tft.fillRect(8, 124, 220, 10, ST77XX_BLACK);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(8, 124);
+  tft.print("TACH RAW: ");
+  tft.print(tachCountSnapshot);
+
   lastUiSpeed = targetSpeedPercent;
   lastUiRpm = rpmInt;
+  lastUiTachCount = tachCountSnapshot;
 }
 
 void handleHardwareButtons() {
@@ -370,8 +414,9 @@ void setup() {
   Serial.println();
   Serial.println("AC Infinity controller booting...");
 
-  // AC Infinity tach output behaves best with pull-up + rising-edge counting.
-  pinMode(FAN_TACH_PIN, INPUT_PULLUP);
+  // External bias network shown in your diagram (1k to 3.3V, 10k to GND)
+  // provides line conditioning, so use plain INPUT.
+  pinMode(FAN_TACH_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
 
   pinMode(BTN_MINUS_PIN, BTN_MINUS_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
@@ -387,10 +432,6 @@ void setup() {
   tft.init(135, 240);
   tft.setRotation(3);
   drawStaticUi();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(8, 124);
-  tft.print("D0:-10  D1:50%  D2:+10");
 
   applyFanSpeed(targetSpeedPercent);
   lastRpmSampleMs = millis();
