@@ -93,20 +93,25 @@ static const int MIN_RUN_PERCENT = 15;
 
 // AC Infinity FG line appears to output 3 pulses per revolution.
 static const float TACH_PULSES_PER_REV = 3.0f;
-// 5000 us min edge interval ~= 6000 RPM max for 2 pulses/rev.
+// 5000 us min edge interval ~= 4000 RPM max for 3 pulses/rev.
 // This aggressively rejects high-frequency noise seen on the tach line.
 static const uint32_t TACH_MIN_EDGE_US = 5000;
-static const float MAX_REASONABLE_RPM = 4500.0;
+static const float MAX_REASONABLE_RPM = 4000.0;
 static const uint32_t RPM_SAMPLE_MS = 1000;
 static const uint32_t RPM_NO_PULSE_TIMEOUT_MS = 3000;
+static const bool USE_INTERNAL_TACH_PULLUP = false;
 
 volatile uint32_t tachPulseCount = 0;
-volatile uint32_t lastTachEdgeUs = 0;
+volatile uint32_t tachLastCountedRiseUs = 0;
 uint32_t lastRpmSampleMs = 0;
 uint32_t lastPulseSnapshot = 0;
 uint32_t lastPulseSeenMs = 0;
+uint32_t lastDeltaPulses = 0;
+float lastRawRpm = 0.0f;
 float currentRpm = 0.0f;
 int targetSpeedPercent = 40;
+bool rawDutyOverrideEnabled = false;
+uint32_t rawDutyOverride = 0;
 
 uint32_t lastUiDrawMs = 0;
 int lastUiSpeed = -1;
@@ -138,14 +143,24 @@ void writeFanDuty(uint32_t duty) {
 
 void IRAM_ATTR onTachPulse() {
   const uint32_t nowUs = micros();
-  if ((uint32_t)(nowUs - lastTachEdgeUs) < TACH_MIN_EDGE_US) {
+  if ((uint32_t)(nowUs - tachLastCountedRiseUs) < TACH_MIN_EDGE_US) {
     return;
   }
-  lastTachEdgeUs = nowUs;
+
+  tachLastCountedRiseUs = nowUs;
   tachPulseCount++;
 }
 
+int userPercentToEffectivePercent(int percent);
+
 uint32_t percentToDuty(int percent) {
+  const int effectivePercent = userPercentToEffectivePercent(percent);
+
+  const uint32_t maxDuty = (1u << PWM_RES_BITS) - 1u;
+  return (uint32_t)((effectivePercent * (int)maxDuty) / 100);
+}
+
+int userPercentToEffectivePercent(int percent) {
   percent = constrain(percent, 0, 100);
 
   int effectivePercent = percent;
@@ -158,7 +173,6 @@ uint32_t percentToDuty(int percent) {
         request = MIN_RUN_PERCENT;
       }
 
-      // Map user request MIN_RUN..100 to calibrated effective range.
       const float spanReq = (float)(100 - MIN_RUN_PERCENT);
       const float t = spanReq > 0.0f ? (float)(request - MIN_RUN_PERCENT) / spanReq : 1.0f;
       const float eff = (float)INVERTED_EFFECTIVE_AT_MIN +
@@ -174,15 +188,34 @@ uint32_t percentToDuty(int percent) {
     effectivePercent = percent;
   }
 
-  effectivePercent = constrain(effectivePercent, 0, 100);
-
-  const uint32_t maxDuty = (1u << PWM_RES_BITS) - 1u;
-  return (uint32_t)((effectivePercent * (int)maxDuty) / 100);
+  return constrain(effectivePercent, 0, 100);
 }
 
 void applyFanSpeed(int percent) {
+  rawDutyOverrideEnabled = false;
   targetSpeedPercent = constrain(percent, 0, 100);
-  writeFanDuty(percentToDuty(targetSpeedPercent));
+  const int effectivePercent = userPercentToEffectivePercent(targetSpeedPercent);
+  const uint32_t duty = percentToDuty(targetSpeedPercent);
+  writeFanDuty(duty);
+
+  Serial.print("PWM map: request ");
+  Serial.print(targetSpeedPercent);
+  Serial.print("% -> effective ");
+  Serial.print(effectivePercent);
+  Serial.print("% -> duty ");
+  Serial.println(duty);
+}
+
+void applyRawDuty(uint32_t duty) {
+  const uint32_t maxDuty = (1u << PWM_RES_BITS) - 1u;
+  rawDutyOverride = constrain(duty, 0u, maxDuty);
+  rawDutyOverrideEnabled = true;
+  writeFanDuty(rawDutyOverride);
+
+  Serial.print("PWM raw override: duty ");
+  Serial.print(rawDutyOverride);
+  Serial.print("/");
+  Serial.println(maxDuty);
 }
 
 void updateRpm() {
@@ -199,6 +232,7 @@ void updateRpm() {
   interrupts();
 
   const uint32_t deltaPulses = pulseSnapshot - lastPulseSnapshot;
+  lastDeltaPulses = deltaPulses;
   lastPulseSnapshot = pulseSnapshot;
   lastRpmSampleMs = now;
 
@@ -214,12 +248,12 @@ void updateRpm() {
   lastPulseSeenMs = now;
 
   if (minutes > 0.0f) {
-    float rpm = revs / minutes;
-    if (rpm > MAX_REASONABLE_RPM) {
-      rpm = MAX_REASONABLE_RPM;
+    float rpmCalc = revs / minutes;
+    if (rpmCalc > MAX_REASONABLE_RPM) {
+      rpmCalc = MAX_REASONABLE_RPM;
     }
-    // Smooth tach updates so brief pulse jitter does not flicker the reading.
-    currentRpm = (currentRpm * 0.6f) + (rpm * 0.4f);
+    lastRawRpm = rpmCalc;
+    currentRpm = rpmCalc;
   }
 }
 
@@ -232,7 +266,158 @@ void printStatus() {
   Serial.println((int)currentRpm);
   Serial.print("PWM duty raw: ");
   Serial.println(percentToDuty(targetSpeedPercent));
+  Serial.print("Raw duty override: ");
+  if (rawDutyOverrideEnabled) {
+    Serial.println(rawDutyOverride);
+  } else {
+    Serial.println("off");
+  }
   Serial.println("------------------------------");
+}
+
+void dumpRawTach(uint32_t durationMs) {
+  durationMs = constrain(durationMs, 200u, 10000u);
+
+  Serial.println();
+  Serial.print("Raw GPIO13 tach capture for ");
+  Serial.print(durationMs);
+  Serial.println(" ms...");
+
+  const uint32_t startUs = micros();
+  uint32_t lastEdgeUs = startUs;
+  uint32_t nowUs = startUs;
+
+  int lastState = digitalRead(FAN_TACH_PIN);
+  uint32_t highUs = 0;
+  uint32_t lowUs = 0;
+  uint32_t transitions = 0;
+  uint32_t risingEdges = 0;
+  uint32_t fallingEdges = 0;
+  uint32_t minSegmentUs = 0xFFFFFFFFu;
+  uint32_t maxSegmentUs = 0;
+
+  while ((uint32_t)(nowUs - startUs) < (durationMs * 1000u)) {
+    const int state = digitalRead(FAN_TACH_PIN);
+    nowUs = micros();
+
+    if (state != lastState) {
+      const uint32_t segUs = nowUs - lastEdgeUs;
+      if (lastState == HIGH) {
+        highUs += segUs;
+      } else {
+        lowUs += segUs;
+      }
+
+      if (segUs < minSegmentUs) {
+        minSegmentUs = segUs;
+      }
+      if (segUs > maxSegmentUs) {
+        maxSegmentUs = segUs;
+      }
+
+      transitions++;
+      if (state == HIGH) {
+        risingEdges++;
+      } else {
+        fallingEdges++;
+      }
+
+      lastState = state;
+      lastEdgeUs = nowUs;
+    }
+  }
+
+  nowUs = micros();
+  const uint32_t tailUs = nowUs - lastEdgeUs;
+  if (lastState == HIGH) {
+    highUs += tailUs;
+  } else {
+    lowUs += tailUs;
+  }
+
+  const uint32_t totalUs = nowUs - startUs;
+  const float highPct = totalUs > 0 ? (100.0f * (float)highUs / (float)totalUs) : 0.0f;
+  const float lowPct = 100.0f - highPct;
+  const float risingHz = totalUs > 0 ? ((float)risingEdges * 1000000.0f / (float)totalUs) : 0.0f;
+  const float estRpm = (risingHz * 60.0f) / TACH_PULSES_PER_REV;
+
+  Serial.println("--- Raw GPIO13 Capture ---");
+  Serial.print("Transitions: ");
+  Serial.println(transitions);
+  Serial.print("Rising edges: ");
+  Serial.println(risingEdges);
+  Serial.print("Falling edges: ");
+  Serial.println(fallingEdges);
+  Serial.print("High time (%): ");
+  Serial.println(highPct, 2);
+  Serial.print("Low time (%): ");
+  Serial.println(lowPct, 2);
+
+  if (transitions > 0) {
+    Serial.print("Min segment (us): ");
+    Serial.println(minSegmentUs);
+    Serial.print("Max segment (us): ");
+    Serial.println(maxSegmentUs);
+  } else {
+    Serial.println("No edges detected.");
+  }
+
+  Serial.print("Edge freq (Hz, rising): ");
+  Serial.println(risingHz, 2);
+  Serial.print("Est RPM from raw edges: ");
+  Serial.println(estRpm, 1);
+  Serial.println("-------------------------");
+}
+
+void runStepTest() {
+  const int testSpeeds[] = {10, 50, 100};
+  const size_t stepCount = sizeof(testSpeeds) / sizeof(testSpeeds[0]);
+  const uint32_t settleMs = 4000;
+  const uint32_t sampleMs = 6000;
+
+  Serial.println();
+  Serial.println("=== Tach Step Test (avg RPM) ===");
+  Serial.print("Settle per step (ms): ");
+  Serial.println(settleMs);
+  Serial.print("Sample per step (ms): ");
+  Serial.println(sampleMs);
+
+  for (size_t i = 0; i < stepCount; ++i) {
+    const int speed = testSpeeds[i];
+    applyFanSpeed(speed);
+    Serial.print("Step ");
+    Serial.print(i + 1);
+    Serial.print(" -> speed ");
+    Serial.print(speed);
+    Serial.println("% (settling)...");
+    delay(settleMs);
+
+    uint32_t startPulses;
+    noInterrupts();
+    startPulses = tachPulseCount;
+    interrupts();
+
+    delay(sampleMs);
+
+    uint32_t endPulses;
+    noInterrupts();
+    endPulses = tachPulseCount;
+    interrupts();
+
+    const uint32_t delta = endPulses - startPulses;
+    const float revs = delta / TACH_PULSES_PER_REV;
+    const float minutes = sampleMs / 60000.0f;
+    const float avgRpm = minutes > 0.0f ? (revs / minutes) : 0.0f;
+
+    Serial.print("Result speed ");
+    Serial.print(speed);
+    Serial.print("%: pulses=");
+    Serial.print(delta);
+    Serial.print(", avgRPM=");
+    Serial.println(avgRpm, 1);
+  }
+
+  Serial.println("=== End Step Test ===");
 }
 
 void drawStaticUi() {
@@ -251,6 +436,9 @@ void drawStaticUi() {
 
   tft.setCursor(8, 66);
   tft.print("RPM:");
+
+  tft.setCursor(8, 96);
+  tft.print("dP/R:");
 }
 
 void updateUi(bool force) {
@@ -279,12 +467,14 @@ void updateUi(bool force) {
   tft.setCursor(70, 66);
   tft.print(rpmInt);
 
-  tft.fillRect(8, 124, 220, 10, ST77XX_BLACK);
+  tft.fillRect(70, 96, 162, 20, ST77XX_BLACK);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(8, 124);
-  tft.print("TACH RAW: ");
-  tft.print(tachCountSnapshot);
+  tft.setTextSize(2);
+  tft.setCursor(70, 96);
+  tft.print("dP:");
+  tft.print(lastDeltaPulses);
+  tft.print(" R:");
+  tft.print((int)lastRawRpm);
 
   lastUiSpeed = targetSpeedPercent;
   lastUiRpm = rpmInt;
@@ -339,6 +529,10 @@ void printHelp() {
   Serial.println();
   Serial.println("Commands:");
   Serial.println("  speed <0-100>   Set fan speed percentage");
+  Serial.println("  pwmduty <0-1023> Set raw PWM duty directly");
+  Serial.println("  pwmauto         Return to mapped speed mode");
+  Serial.println("  rawtach [ms]    Raw GPIO13 capture (200..10000 ms)");
+  Serial.println("  steptest        Auto-test 10/50/100% with averaged RPM");
   Serial.println("  + / inc         Increase speed by 10%");
   Serial.println("  - / dec         Decrease speed by 10%");
   Serial.println("  D0 button       Decrease speed by 10%");
@@ -368,6 +562,47 @@ void handleSerialCommand() {
 
   if (line.equalsIgnoreCase("help")) {
     printHelp();
+    return;
+  }
+
+  if (line.equalsIgnoreCase("pwmauto")) {
+    applyFanSpeed(targetSpeedPercent);
+    Serial.println("PWM auto mapping restored.");
+    return;
+  }
+
+  if (line.startsWith("pwmduty ") || line.startsWith("PWMDUTY ")) {
+    String valueText = line.substring(8);
+    valueText.trim();
+    long value = valueText.toInt();
+    if (value < 0 || value > ((1 << PWM_RES_BITS) - 1)) {
+      Serial.print("Invalid duty. Use 0..");
+      Serial.println((1 << PWM_RES_BITS) - 1);
+      return;
+    }
+    applyRawDuty((uint32_t)value);
+    return;
+  }
+
+  if (line.equalsIgnoreCase("rawtach")) {
+    dumpRawTach(2000);
+    return;
+  }
+
+  if (line.equalsIgnoreCase("steptest")) {
+    runStepTest();
+    return;
+  }
+
+  if (line.startsWith("rawtach ") || line.startsWith("RAWTACH ")) {
+    String valueText = line.substring(8);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid rawtach duration. Use milliseconds, e.g. rawtach 3000");
+      return;
+    }
+    dumpRawTach(durationMs);
     return;
   }
 
@@ -414,9 +649,7 @@ void setup() {
   Serial.println();
   Serial.println("AC Infinity controller booting...");
 
-  // External bias network shown in your diagram (1k to 3.3V, 10k to GND)
-  // provides line conditioning, so use plain INPUT.
-  pinMode(FAN_TACH_PIN, INPUT);
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
   attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
 
   pinMode(BTN_MINUS_PIN, BTN_MINUS_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
