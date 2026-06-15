@@ -91,13 +91,12 @@ static const int INVERTED_EFFECTIVE_AT_MIN = 85; // user MIN_RUN_PERCENT
 // whenever the user asks for a nonzero speed.
 static const int MIN_RUN_PERCENT = 15;
 
-// AC Infinity FG line appears to output 3 pulses per revolution.
+// Tach input: 3 pulses per fan revolution.
 static const float TACH_PULSES_PER_REV = 3.0f;
-// 5000 us min edge interval ~= 4000 RPM max for 3 pulses/rev.
-// This aggressively rejects high-frequency noise seen on the tach line.
+// Reject very fast edges so noise does not look like real tach pulses.
 static const uint32_t TACH_MIN_EDGE_US = 5000;
 static const float MAX_REASONABLE_RPM = 4000.0;
-static const uint32_t RPM_SAMPLE_MS = 1000;
+static const uint32_t RPM_SAMPLE_MS = 5000;
 static const uint32_t RPM_NO_PULSE_TIMEOUT_MS = 3000;
 static const bool USE_INTERNAL_TACH_PULLUP = false;
 
@@ -236,8 +235,6 @@ void updateRpm() {
   lastPulseSnapshot = pulseSnapshot;
   lastRpmSampleMs = now;
 
-  const float revs = deltaPulses / TACH_PULSES_PER_REV;
-  const float minutes = intervalMs / 60000.0f;
   if (deltaPulses == 0) {
     if ((now - lastPulseSeenMs) >= RPM_NO_PULSE_TIMEOUT_MS) {
       currentRpm = 0.0f;
@@ -247,8 +244,9 @@ void updateRpm() {
 
   lastPulseSeenMs = now;
 
-  if (minutes > 0.0f) {
-    float rpmCalc = revs / minutes;
+  if (intervalMs > 0) {
+    // With a 5-second window and 3 pulses/rev, RPM = pulseCount * 4.
+    float rpmCalc = deltaPulses * 4.0f;
     if (rpmCalc > MAX_REASONABLE_RPM) {
       rpmCalc = MAX_REASONABLE_RPM;
     }
@@ -438,7 +436,7 @@ void drawStaticUi() {
   tft.print("RPM:");
 
   tft.setCursor(8, 96);
-  tft.print("dP/R:");
+  tft.print("TACH:");
 }
 
 void updateUi(bool force) {
@@ -471,9 +469,9 @@ void updateUi(bool force) {
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
   tft.setCursor(70, 96);
-  tft.print("dP:");
+  tft.print("P:");
   tft.print(lastDeltaPulses);
-  tft.print(" R:");
+  tft.print(" RPM:");
   tft.print((int)lastRawRpm);
 
   lastUiSpeed = targetSpeedPercent;

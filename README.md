@@ -9,6 +9,10 @@ Current verified pin map (your existing build):
 
 For tach conditioning, use your external resistor network on the tach line (no board rewiring required).
 
+I used this as inspiration
+https://www.reddit.com/r/homeassistant/comments/1lhveyu/ac_infinity_fan_esphome_control_with_tachometer/
+
+
 ## Files
 
 - `WireDiagram.txt`: your hardware mapping
@@ -67,7 +71,11 @@ In Arduino IDE, go to **Tools -> Manage Libraries...** and install:
    - `speed 50`
    - `speed 100`
 
-The firmware reports measured RPM every few seconds.
+The firmware reports measured RPM every 5 seconds.
+
+The tach math uses a 5-second sample window and assumes 3 tach pulses per revolution, so the code can use the shortcut:
+
+- `RPM = pulses in 5 seconds x 4`
 
 Phase 1 note: on-screen `-10` and `+10` boxes are display indicators only. Tap input is not enabled yet on this hardware profile.
 
