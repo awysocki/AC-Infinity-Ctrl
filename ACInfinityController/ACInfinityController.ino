@@ -42,8 +42,8 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // -----------------------------
 // Pin and control configuration
 // -----------------------------
-static const int FAN_PWM_PIN = 12;      // Drives BS170 gate
-static const int FAN_TACH_PIN = 13;     // Reads tach pulses (FG)
+static const int FAN_PWM_PIN = 12;      // Known-good PWM pin
+static const int FAN_TACH_PIN = 13;     // Known-good tach pin
 
 #if defined(D0)
 static const int BTN_MINUS_PIN = D0;
@@ -99,6 +99,9 @@ static const float MAX_REASONABLE_RPM = 4000.0;
 static const uint32_t RPM_SAMPLE_MS = 5000;
 static const uint32_t RPM_NO_PULSE_TIMEOUT_MS = 3000;
 static const bool USE_INTERNAL_TACH_PULLUP = false;
+
+static const uint32_t UART_SCAN_BAUDS[] = {9600, 10000, 10400, 11000, 11520, 19200, 38400, 57600, 115200};
+static const bool UART_SCAN_INCLUDE_INVERTED = false;
 
 volatile uint32_t tachPulseCount = 0;
 volatile uint32_t tachLastCountedRiseUs = 0;
@@ -277,7 +280,9 @@ void dumpRawTach(uint32_t durationMs) {
   durationMs = constrain(durationMs, 200u, 10000u);
 
   Serial.println();
-  Serial.print("Raw GPIO13 tach capture for ");
+  Serial.print("Raw tach capture on pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
   Serial.print(durationMs);
   Serial.println(" ms...");
 
@@ -339,7 +344,9 @@ void dumpRawTach(uint32_t durationMs) {
   const float risingHz = totalUs > 0 ? ((float)risingEdges * 1000000.0f / (float)totalUs) : 0.0f;
   const float estRpm = (risingHz * 60.0f) / TACH_PULSES_PER_REV;
 
-  Serial.println("--- Raw GPIO13 Capture ---");
+  Serial.print("--- Raw Tach Capture (pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.println(") ---");
   Serial.print("Transitions: ");
   Serial.println(transitions);
   Serial.print("Rising edges: ");
@@ -365,6 +372,585 @@ void dumpRawTach(uint32_t durationMs) {
   Serial.print("Est RPM from raw edges: ");
   Serial.println(estRpm, 1);
   Serial.println("-------------------------");
+}
+
+void dumpEdgeTimings(uint32_t durationMs) {
+  durationMs = constrain(durationMs, 200u, 5000u);
+
+  Serial.println();
+  Serial.print("Edge timing capture on pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
+  Serial.print(durationMs);
+  Serial.println(" ms...");
+
+  detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN));
+  delay(5);
+
+  const uint32_t startUs = micros();
+  uint32_t nowUs = startUs;
+  uint32_t lastEdgeUs = startUs;
+  int lastState = digitalRead(FAN_TACH_PIN);
+  uint32_t transitions = 0;
+
+  Serial.print("Start state: ");
+  Serial.println(lastState == HIGH ? "HIGH" : "LOW");
+  Serial.println("Segments (state:duration_us), first 120 transitions:");
+
+  while ((uint32_t)(nowUs - startUs) < (durationMs * 1000u)) {
+    const int state = digitalRead(FAN_TACH_PIN);
+    nowUs = micros();
+    if (state != lastState) {
+      const uint32_t segUs = nowUs - lastEdgeUs;
+      Serial.print(lastState == HIGH ? "H:" : "L:");
+      Serial.print(segUs);
+      Serial.print(' ');
+
+      transitions++;
+      if ((transitions % 12u) == 0u) {
+        Serial.println();
+      }
+      if (transitions >= 120u) {
+        Serial.println();
+        Serial.println("(truncated)");
+        break;
+      }
+
+      lastState = state;
+      lastEdgeUs = nowUs;
+    }
+  }
+
+  nowUs = micros();
+  const uint32_t tailUs = nowUs - lastEdgeUs;
+  Serial.print("Tail ");
+  Serial.print(lastState == HIGH ? "H:" : "L:");
+  Serial.println(tailUs);
+
+  Serial.print("Transitions captured: ");
+  Serial.println(transitions);
+
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
+  Serial.println("Edge timing capture complete. Tach interrupt restored.");
+}
+
+void dumpEdgeHistogram(uint32_t durationMs) {
+  durationMs = constrain(durationMs, 200u, 5000u);
+
+  static const uint32_t BIN_US = 10;
+  static const uint32_t MAX_BIN_US = 4000;
+  static const uint32_t BIN_COUNT = (MAX_BIN_US / BIN_US) + 1;
+  uint16_t bins[BIN_COUNT] = {0};
+  uint32_t longSegments = 0;
+  uint32_t glitchSegments = 0;
+
+  Serial.println();
+  Serial.print("Edge histogram on pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
+  Serial.print(durationMs);
+  Serial.println(" ms...");
+
+  detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN));
+  delay(5);
+
+  const uint32_t startUs = micros();
+  uint32_t nowUs = startUs;
+  uint32_t lastEdgeUs = startUs;
+  int lastState = digitalRead(FAN_TACH_PIN);
+  uint32_t transitions = 0;
+
+  while ((uint32_t)(nowUs - startUs) < (durationMs * 1000u)) {
+    const int state = digitalRead(FAN_TACH_PIN);
+    nowUs = micros();
+    if (state != lastState) {
+      const uint32_t segUs = nowUs - lastEdgeUs;
+      if (segUs < 5u) {
+        glitchSegments++;
+      } else if (segUs > MAX_BIN_US) {
+        longSegments++;
+      } else {
+        const uint32_t bin = segUs / BIN_US;
+        if (bin < BIN_COUNT && bins[bin] < 65535u) {
+          bins[bin]++;
+        }
+      }
+
+      transitions++;
+      lastState = state;
+      lastEdgeUs = nowUs;
+    }
+  }
+
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
+
+  uint32_t topBin[6] = {0, 0, 0, 0, 0, 0};
+  uint16_t topCount[6] = {0, 0, 0, 0, 0, 0};
+
+  for (uint32_t b = 0; b < BIN_COUNT; ++b) {
+    const uint16_t c = bins[b];
+    if (c == 0) {
+      continue;
+    }
+    for (int i = 0; i < 6; ++i) {
+      if (c > topCount[i]) {
+        for (int j = 5; j > i; --j) {
+          topCount[j] = topCount[j - 1];
+          topBin[j] = topBin[j - 1];
+        }
+        topCount[i] = c;
+        topBin[i] = b;
+        break;
+      }
+    }
+  }
+
+  Serial.print("Transitions: ");
+  Serial.println(transitions);
+  Serial.print("Glitch segments (<5us): ");
+  Serial.println(glitchSegments);
+  Serial.print("Long segments (>");
+  Serial.print(MAX_BIN_US);
+  Serial.print("us): ");
+  Serial.println(longSegments);
+  Serial.println("Top segment bins (us -> count):");
+
+  for (int i = 0; i < 6; ++i) {
+    if (topCount[i] == 0) {
+      continue;
+    }
+    const uint32_t centerUs = (topBin[i] * BIN_US) + (BIN_US / 2u);
+    Serial.print("  ");
+    Serial.print(centerUs);
+    Serial.print("us -> ");
+    Serial.println(topCount[i]);
+  }
+
+  if (topCount[0] > 0) {
+    const uint32_t bitUs = (topBin[0] * BIN_US) + (BIN_US / 2u);
+    const float estBaud = bitUs > 0 ? (1000000.0f / (float)bitUs) : 0.0f;
+    Serial.print("Estimated base timing: ~");
+    Serial.print(bitUs);
+    Serial.print("us (about ");
+    Serial.print(estBaud, 1);
+    Serial.println(" baud)");
+  }
+
+  Serial.println("Edge histogram complete. Tach interrupt restored.");
+}
+
+void dumpPulseProtocol(uint32_t durationMs) {
+  durationMs = constrain(durationMs, 200u, 5000u);
+
+  // Based on measured bins near 500us and 1000us.
+  static const uint32_t GLITCH_US = 80;
+  static const uint32_t GAP_US = 3000;
+  static const uint32_t SHORT_MAX_US = 750;
+  static const uint32_t LONG_MAX_US = 1800;
+
+  uint32_t shortCount = 0;
+  uint32_t longCount = 0;
+  uint32_t gapCount = 0;
+  uint32_t glitchCount = 0;
+  uint32_t otherCount = 0;
+
+  Serial.println();
+  Serial.print("Pulse protocol capture on pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
+  Serial.print(durationMs);
+  Serial.println(" ms...");
+  Serial.println("Tokens: S~500us, L~1000us, G>3000us, X=other");
+
+  detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN));
+  delay(5);
+
+  const uint32_t startUs = micros();
+  uint32_t nowUs = startUs;
+  uint32_t lastEdgeUs = startUs;
+  int lastState = digitalRead(FAN_TACH_PIN);
+  uint32_t tokenPrinted = 0;
+  uint32_t transitions = 0;
+
+  while ((uint32_t)(nowUs - startUs) < (durationMs * 1000u)) {
+    const int state = digitalRead(FAN_TACH_PIN);
+    nowUs = micros();
+    if (state != lastState) {
+      const uint32_t segUs = nowUs - lastEdgeUs;
+
+      char token = 'X';
+      if (segUs < GLITCH_US) {
+        token = 'g';
+        glitchCount++;
+      } else if (segUs > GAP_US) {
+        token = 'G';
+        gapCount++;
+      } else if (segUs <= SHORT_MAX_US) {
+        token = 'S';
+        shortCount++;
+      } else if (segUs <= LONG_MAX_US) {
+        token = 'L';
+        longCount++;
+      } else {
+        token = 'X';
+        otherCount++;
+      }
+
+      if (tokenPrinted < 240u) {
+        Serial.print(token);
+        tokenPrinted++;
+        if ((tokenPrinted % 60u) == 0u) {
+          Serial.println();
+        }
+      }
+
+      transitions++;
+      lastState = state;
+      lastEdgeUs = nowUs;
+    }
+  }
+
+  if ((tokenPrinted % 60u) != 0u) {
+    Serial.println();
+  }
+  if (tokenPrinted >= 240u) {
+    Serial.println("(token stream truncated)");
+  }
+
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
+
+  Serial.print("Transitions: ");
+  Serial.println(transitions);
+  Serial.print("S count: ");
+  Serial.println(shortCount);
+  Serial.print("L count: ");
+  Serial.println(longCount);
+  Serial.print("G count: ");
+  Serial.println(gapCount);
+  Serial.print("glitch count: ");
+  Serial.println(glitchCount);
+  Serial.print("other count: ");
+  Serial.println(otherCount);
+  Serial.println("Pulse protocol capture complete. Tach interrupt restored.");
+}
+
+void dumpFrameSummary(uint32_t durationMs) {
+  durationMs = constrain(durationMs, 200u, 5000u);
+
+  static const uint32_t GLITCH_US = 80;
+  static const uint32_t GAP_US = 3000;
+  static const uint32_t SHORT_MAX_US = 750;
+  static const uint32_t LONG_MAX_US = 1800;
+  static const uint32_t MAX_FRAME_LEN = 96;
+  static const uint32_t MAX_FRAMES = 10;
+
+  Serial.println();
+  Serial.print("Frame summary on pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
+  Serial.print(durationMs);
+  Serial.println(" ms...");
+  Serial.println("Frames split by gap > 3000us.");
+
+  detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN));
+  delay(5);
+
+  const uint32_t startUs = micros();
+  uint32_t nowUs = startUs;
+  uint32_t lastEdgeUs = startUs;
+  int lastState = digitalRead(FAN_TACH_PIN);
+
+  char frameBuf[MAX_FRAME_LEN + 1];
+  uint32_t frameLen = 0;
+  uint32_t framesPrinted = 0;
+  uint32_t transitions = 0;
+  uint32_t glitchCount = 0;
+
+  while ((uint32_t)(nowUs - startUs) < (durationMs * 1000u)) {
+    const int state = digitalRead(FAN_TACH_PIN);
+    nowUs = micros();
+    if (state != lastState) {
+      const uint32_t segUs = nowUs - lastEdgeUs;
+      transitions++;
+
+      if (segUs < GLITCH_US) {
+        glitchCount++;
+      } else if (segUs > GAP_US) {
+        if (frameLen > 0 && framesPrinted < MAX_FRAMES) {
+          frameBuf[frameLen] = '\0';
+          Serial.print("F");
+          Serial.print(framesPrinted + 1);
+          Serial.print(" len=");
+          Serial.print(frameLen);
+          Serial.print(" : ");
+          Serial.println(frameBuf);
+          framesPrinted++;
+        }
+        frameLen = 0;
+      } else {
+        char token = 'X';
+        if (segUs <= SHORT_MAX_US) {
+          token = 'S';
+        } else if (segUs <= LONG_MAX_US) {
+          token = 'L';
+        }
+
+        if (frameLen < MAX_FRAME_LEN) {
+          frameBuf[frameLen++] = token;
+        }
+      }
+
+      lastState = state;
+      lastEdgeUs = nowUs;
+    }
+  }
+
+  // Flush any trailing partial frame.
+  if (frameLen > 0 && framesPrinted < MAX_FRAMES) {
+    frameBuf[frameLen] = '\0';
+    Serial.print("F");
+    Serial.print(framesPrinted + 1);
+    Serial.print(" len=");
+    Serial.print(frameLen);
+    Serial.print(" : ");
+    Serial.println(frameBuf);
+    framesPrinted++;
+  }
+
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
+
+  Serial.print("Transitions: ");
+  Serial.println(transitions);
+  Serial.print("Glitches ignored: ");
+  Serial.println(glitchCount);
+  Serial.print("Frames shown: ");
+  Serial.println(framesPrinted);
+  Serial.println("Frame summary complete. Tach interrupt restored.");
+}
+
+uint32_t decodeBitsFromTokens(const char* tokens, uint32_t tokenLen, uint8_t* bits, uint32_t bitsMax) {
+  uint32_t bitCount = 0;
+  uint32_t i = 0;
+  while (i + 1 < tokenLen && bitCount < bitsMax) {
+    if (tokens[i] == 'S' && (tokens[i + 1] == 'S' || tokens[i + 1] == 'L')) {
+      bits[bitCount++] = (tokens[i + 1] == 'L') ? 1u : 0u;
+      i += 2;
+    } else {
+      i++;
+    }
+  }
+  return bitCount;
+}
+
+void addWordHit(uint16_t word, uint16_t* words, uint16_t* counts, uint32_t maxItems) {
+  for (uint32_t i = 0; i < maxItems; ++i) {
+    if (counts[i] == 0) {
+      words[i] = word;
+      counts[i] = 1;
+      return;
+    }
+    if (words[i] == word) {
+      if (counts[i] < 65535u) {
+        counts[i]++;
+      }
+      return;
+    }
+  }
+}
+
+void dumpDecode16(uint32_t durationMs) {
+  durationMs = constrain(durationMs, 300u, 6000u);
+
+  static const uint32_t GLITCH_US = 80;
+  static const uint32_t GAP_US = 2000;
+  static const uint32_t SHORT_MIN_US = 350;
+  static const uint32_t SHORT_MAX_US = 700;
+  static const uint32_t LONG_MIN_US = 850;
+  static const uint32_t LONG_MAX_US = 1300;
+  static const uint32_t MAX_FRAME_BITS = 64;
+  static const uint32_t MAX_UNIQUE_WORDS = 96;
+
+  uint16_t wordsDirect[MAX_UNIQUE_WORDS] = {0};
+  uint16_t countsDirect[MAX_UNIQUE_WORDS] = {0};
+  uint16_t wordsInverted[MAX_UNIQUE_WORDS] = {0};
+  uint16_t countsInverted[MAX_UNIQUE_WORDS] = {0};
+  uint32_t totalFrames = 0;
+  uint32_t decodedFrames = 0;
+  uint32_t glitchCount = 0;
+  uint32_t ignoredSegments = 0;
+
+  Serial.println();
+  Serial.print("Decode16 capture on pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
+  Serial.print(durationMs);
+  Serial.println(" ms...");
+  Serial.println("Decoding low segments: ~500us=0, ~1000us=1");
+
+  detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN));
+  delay(5);
+
+  const uint32_t startUs = micros();
+  uint32_t nowUs = startUs;
+  uint32_t lastEdgeUs = startUs;
+  int lastState = digitalRead(FAN_TACH_PIN);
+
+  uint8_t frameBits[MAX_FRAME_BITS] = {0};
+  uint32_t frameBitCount = 0;
+
+  auto flushFrame = [&]() {
+    if (frameBitCount < 16u) {
+      frameBitCount = 0;
+      return;
+    }
+
+    totalFrames++;
+    decodedFrames++;
+
+    // Use first 16 bits in each frame; also record inverted mapping because
+    // line polarity might be opposite of our assumption.
+    uint16_t wDirect = 0;
+    uint16_t wInverted = 0;
+    for (uint32_t b = 0; b < 16u; ++b) {
+      const uint8_t bit = frameBits[b] ? 1u : 0u;
+      wDirect = (uint16_t)((wDirect << 1) | bit);
+      wInverted = (uint16_t)((wInverted << 1) | (bit ? 0u : 1u));
+    }
+
+    addWordHit(wDirect, wordsDirect, countsDirect, MAX_UNIQUE_WORDS);
+    addWordHit(wInverted, wordsInverted, countsInverted, MAX_UNIQUE_WORDS);
+
+    frameBitCount = 0;
+  };
+
+  while ((uint32_t)(nowUs - startUs) < (durationMs * 1000u)) {
+    const int state = digitalRead(FAN_TACH_PIN);
+    nowUs = micros();
+    if (state != lastState) {
+      const uint32_t segUs = nowUs - lastEdgeUs;
+
+      if (segUs < GLITCH_US) {
+        glitchCount++;
+      } else if (lastState == LOW && segUs > GAP_US) {
+        // Long low gap separates repeated frames.
+        flushFrame();
+      } else if (lastState == LOW) {
+        // Decode only LOW segment widths as bits.
+        if (segUs >= SHORT_MIN_US && segUs <= SHORT_MAX_US) {
+          if (frameBitCount < MAX_FRAME_BITS) {
+            frameBits[frameBitCount++] = 0u;
+          }
+        } else if (segUs >= LONG_MIN_US && segUs <= LONG_MAX_US) {
+          if (frameBitCount < MAX_FRAME_BITS) {
+            frameBits[frameBitCount++] = 1u;
+          }
+        } else {
+          ignoredSegments++;
+        }
+      }
+
+      lastState = state;
+      lastEdgeUs = nowUs;
+    }
+  }
+
+  flushFrame();
+
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
+
+  Serial.print("Total frames seen: ");
+  Serial.println(totalFrames);
+  Serial.print("Frames decoded (>=16 bits): ");
+  Serial.println(decodedFrames);
+  Serial.print("Glitches ignored: ");
+  Serial.println(glitchCount);
+  Serial.print("Non-bit low segments ignored: ");
+  Serial.println(ignoredSegments);
+
+  Serial.println("Top DIRECT candidates (word, count, nibbles):");
+
+  // Print up to 12 strongest hits.
+  for (int rank = 0; rank < 12; ++rank) {
+    uint16_t bestCount = 0;
+    int bestIdx = -1;
+    for (uint32_t i = 0; i < MAX_UNIQUE_WORDS; ++i) {
+      if (countsDirect[i] > bestCount) {
+        bestCount = countsDirect[i];
+        bestIdx = (int)i;
+      }
+    }
+
+    if (bestIdx < 0 || bestCount == 0) {
+      break;
+    }
+
+    const uint16_t w = wordsDirect[bestIdx];
+    const uint8_t n3 = (uint8_t)((w >> 12) & 0x0F);
+    const uint8_t n2 = (uint8_t)((w >> 8) & 0x0F);
+    const uint8_t n1 = (uint8_t)((w >> 4) & 0x0F);
+    const uint8_t n0 = (uint8_t)(w & 0x0F);
+
+    Serial.print("  0x");
+    printHexByte((uint8_t)(w >> 8));
+    printHexByte((uint8_t)(w & 0xFF));
+    Serial.print("  count=");
+    Serial.print(bestCount);
+    Serial.print("  nibbles=");
+    Serial.print(n3, HEX);
+    Serial.print(' ');
+    Serial.print(n2, HEX);
+    Serial.print(' ');
+    Serial.print(n1, HEX);
+    Serial.print(' ');
+    Serial.println(n0, HEX);
+
+    countsDirect[bestIdx] = 0;
+  }
+
+  Serial.println("Top INVERTED candidates (word, count, nibbles):");
+  for (int rank = 0; rank < 12; ++rank) {
+    uint16_t bestCount = 0;
+    int bestIdx = -1;
+    for (uint32_t i = 0; i < MAX_UNIQUE_WORDS; ++i) {
+      if (countsInverted[i] > bestCount) {
+        bestCount = countsInverted[i];
+        bestIdx = (int)i;
+      }
+    }
+
+    if (bestIdx < 0 || bestCount == 0) {
+      break;
+    }
+
+    const uint16_t w = wordsInverted[bestIdx];
+    const uint8_t n3 = (uint8_t)((w >> 12) & 0x0F);
+    const uint8_t n2 = (uint8_t)((w >> 8) & 0x0F);
+    const uint8_t n1 = (uint8_t)((w >> 4) & 0x0F);
+    const uint8_t n0 = (uint8_t)(w & 0x0F);
+
+    Serial.print("  0x");
+    printHexByte((uint8_t)(w >> 8));
+    printHexByte((uint8_t)(w & 0xFF));
+    Serial.print("  count=");
+    Serial.print(bestCount);
+    Serial.print("  nibbles=");
+    Serial.print(n3, HEX);
+    Serial.print(' ');
+    Serial.print(n2, HEX);
+    Serial.print(' ');
+    Serial.print(n1, HEX);
+    Serial.print(' ');
+    Serial.println(n0, HEX);
+
+    countsInverted[bestIdx] = 0;
+  }
+
+  Serial.println("Decode16 complete. Tach interrupt restored.");
 }
 
 void runStepTest() {
@@ -416,6 +1002,100 @@ void runStepTest() {
   }
 
   Serial.println("=== End Step Test ===");
+}
+
+void printHexByte(uint8_t b) {
+  const char* hex = "0123456789ABCDEF";
+  Serial.print(hex[(b >> 4) & 0x0F]);
+  Serial.print(hex[b & 0x0F]);
+}
+
+void scanUartOnTach(uint32_t totalMs) {
+  totalMs = constrain(totalMs, 1000u, 30000u);
+  const uint32_t invertModes = UART_SCAN_INCLUDE_INVERTED ? 2u : 1u;
+  const uint32_t modeCount = (sizeof(UART_SCAN_BAUDS) / sizeof(UART_SCAN_BAUDS[0])) * invertModes;
+  const uint32_t perModeMs = totalMs / modeCount;
+
+  Serial.println();
+  Serial.print("UART scan on D- pin ");
+  Serial.print(FAN_TACH_PIN);
+  Serial.print(" for ");
+  Serial.print(totalMs);
+  Serial.println(" ms");
+  Serial.println(UART_SCAN_INCLUDE_INVERTED
+                   ? "Trying common baud rates with normal and inverted polarity."
+                   : "Trying common baud rates with normal polarity only.");
+
+  detachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN));
+  delay(5);
+
+  HardwareSerial& probe = Serial1;
+  for (size_t i = 0; i < sizeof(UART_SCAN_BAUDS) / sizeof(UART_SCAN_BAUDS[0]); ++i) {
+    const uint32_t baud = UART_SCAN_BAUDS[i];
+    for (uint32_t invertIdx = 0; invertIdx < invertModes; ++invertIdx) {
+      const bool invert = invertIdx == 1;
+
+      probe.end();
+      delay(2);
+      probe.begin(baud, SERIAL_8N1, FAN_TACH_PIN, -1, invert);
+      delay(10);
+
+      while (probe.available()) {
+        (void)probe.read();
+      }
+
+      const uint32_t startMs = millis();
+      uint32_t byteCount = 0;
+      uint32_t lineCount = 0;
+
+      Serial.print("Mode baud=");
+      Serial.print(baud);
+      Serial.print(" invert=");
+      Serial.println(invert ? "true" : "false");
+
+      while ((millis() - startMs) < perModeMs) {
+        while (probe.available()) {
+          const int v = probe.read();
+          if (v < 0) {
+            break;
+          }
+
+          if ((byteCount % 16u) == 0u) {
+            Serial.print("  ");
+          }
+
+          printHexByte((uint8_t)v);
+          Serial.print(' ');
+          byteCount++;
+
+          if ((byteCount % 16u) == 0u) {
+            Serial.println();
+            lineCount++;
+            if (lineCount >= 6u) {
+              break;
+            }
+          }
+        }
+
+        if (lineCount >= 6u) {
+          break;
+        }
+      }
+
+      if ((byteCount % 16u) != 0u) {
+        Serial.println();
+      }
+
+      Serial.print("  bytes=");
+      Serial.println(byteCount);
+      Serial.println();
+    }
+  }
+
+  probe.end();
+  pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
+  attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
+  Serial.println("UART scan complete. Tach interrupt restored.");
 }
 
 void drawStaticUi() {
@@ -529,7 +1209,13 @@ void printHelp() {
   Serial.println("  speed <0-100>   Set fan speed percentage");
   Serial.println("  pwmduty <0-1023> Set raw PWM duty directly");
   Serial.println("  pwmauto         Return to mapped speed mode");
-  Serial.println("  rawtach [ms]    Raw GPIO13 capture (200..10000 ms)");
+  Serial.println("  rawtach [ms]    Raw tach capture (200..10000 ms)");
+  Serial.println("  edgesnap [ms]   Print high/low segment timings on D- (200..5000 ms)");
+  Serial.println("  edgehist [ms]   Compact timing histogram on D- (200..5000 ms)");
+  Serial.println("  pulsecap [ms]   Tokenize D- into S/L/G pulses (200..5000 ms)");
+  Serial.println("  framesnap [ms]  Show pulse frames split by long gaps (200..5000 ms)");
+  Serial.println("  decode16 [ms]   Extract candidate 16-bit payload words (300..6000 ms)");
+  Serial.println("  uartscan [ms]   Probe D- as UART data (1000..30000 ms)");
   Serial.println("  steptest        Auto-test 10/50/100% with averaged RPM");
   Serial.println("  + / inc         Increase speed by 10%");
   Serial.println("  - / dec         Decrease speed by 10%");
@@ -587,8 +1273,38 @@ void handleSerialCommand() {
     return;
   }
 
+  if (line.equalsIgnoreCase("edgesnap")) {
+    dumpEdgeTimings(1000);
+    return;
+  }
+
+  if (line.equalsIgnoreCase("edgehist")) {
+    dumpEdgeHistogram(1000);
+    return;
+  }
+
+  if (line.equalsIgnoreCase("pulsecap")) {
+    dumpPulseProtocol(1200);
+    return;
+  }
+
+  if (line.equalsIgnoreCase("framesnap")) {
+    dumpFrameSummary(1200);
+    return;
+  }
+
+  if (line.equalsIgnoreCase("decode16")) {
+    dumpDecode16(1500);
+    return;
+  }
+
   if (line.equalsIgnoreCase("steptest")) {
     runStepTest();
+    return;
+  }
+
+  if (line.equalsIgnoreCase("uartscan")) {
+    scanUartOnTach(12000);
     return;
   }
 
@@ -601,6 +1317,78 @@ void handleSerialCommand() {
       return;
     }
     dumpRawTach(durationMs);
+    return;
+  }
+
+  if (line.startsWith("edgesnap ") || line.startsWith("EDGESNAP ")) {
+    String valueText = line.substring(9);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid edgesnap duration. Use milliseconds, e.g. edgesnap 1000");
+      return;
+    }
+    dumpEdgeTimings(durationMs);
+    return;
+  }
+
+  if (line.startsWith("edgehist ") || line.startsWith("EDGEHIST ")) {
+    String valueText = line.substring(9);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid edgehist duration. Use milliseconds, e.g. edgehist 1000");
+      return;
+    }
+    dumpEdgeHistogram(durationMs);
+    return;
+  }
+
+  if (line.startsWith("pulsecap ") || line.startsWith("PULSECAP ")) {
+    String valueText = line.substring(9);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid pulsecap duration. Use milliseconds, e.g. pulsecap 1200");
+      return;
+    }
+    dumpPulseProtocol(durationMs);
+    return;
+  }
+
+  if (line.startsWith("framesnap ") || line.startsWith("FRAMESNAP ")) {
+    String valueText = line.substring(10);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid framesnap duration. Use milliseconds, e.g. framesnap 1200");
+      return;
+    }
+    dumpFrameSummary(durationMs);
+    return;
+  }
+
+  if (line.startsWith("decode16 ") || line.startsWith("DECODE16 ")) {
+    String valueText = line.substring(9);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid decode16 duration. Use milliseconds, e.g. decode16 1500");
+      return;
+    }
+    dumpDecode16(durationMs);
+    return;
+  }
+
+  if (line.startsWith("uartscan ") || line.startsWith("UARTSCAN ")) {
+    String valueText = line.substring(9);
+    valueText.trim();
+    uint32_t durationMs = (uint32_t)valueText.toInt();
+    if (durationMs == 0) {
+      Serial.println("Invalid uartscan duration. Use milliseconds, e.g. uartscan 12000");
+      return;
+    }
+    scanUartOnTach(durationMs);
     return;
   }
 
@@ -646,6 +1434,16 @@ void setup() {
 
   Serial.println();
   Serial.println("AC Infinity controller booting...");
+  Serial.print("PWM pin: ");
+  Serial.println(FAN_PWM_PIN);
+  Serial.print("Tach pin: ");
+  Serial.println(FAN_TACH_PIN);
+  Serial.print("PWM freq (Hz): ");
+  Serial.println(PWM_FREQ_HZ);
+  Serial.print("PWM resolution (bits): ");
+  Serial.println(PWM_RES_BITS);
+  Serial.print("PWM active-low-at-fan-line: ");
+  Serial.println(PWM_ACTIVE_LOW_AT_FAN_LINE ? "true" : "false");
 
   pinMode(FAN_TACH_PIN, USE_INTERNAL_TACH_PULLUP ? INPUT_PULLUP : INPUT);
   attachInterrupt(digitalPinToInterrupt(FAN_TACH_PIN), onTachPulse, RISING);
@@ -684,19 +1482,5 @@ void loop() {
     updateUi(false);
   }
 
-  static uint32_t lastPrint = 0;
-  if (now - lastPrint > 3000) {
-    lastPrint = now;
-    uint32_t pulseSnapshot;
-    noInterrupts();
-    pulseSnapshot = tachPulseCount;
-    interrupts();
-    Serial.print("RPM: ");
-    Serial.print((int)currentRpm);
-    Serial.print(" | TachCount: ");
-    Serial.print(pulseSnapshot);
-    Serial.print(" | Speed: ");
-    Serial.print(targetSpeedPercent);
-    Serial.println("%");
-  }
+  // Periodic serial spam disabled; use 'status' when needed.
 }
