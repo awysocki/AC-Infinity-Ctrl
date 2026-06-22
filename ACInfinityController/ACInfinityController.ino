@@ -3258,24 +3258,12 @@ void updateUi(bool force) {
 
 int nextButtonSpeedUp(int currentSpeed) {
   currentSpeed = constrain(currentSpeed, 0, 100);
-  if (currentSpeed < 10) {
-    return 10;
-  }
-  if (currentSpeed < 99) {
-    return currentSpeed + 1;
-  }
-  return 100;
+  return constrain(currentSpeed + 10, 0, 100);
 }
 
 int nextButtonSpeedDown(int currentSpeed) {
   currentSpeed = constrain(currentSpeed, 0, 100);
-  if (currentSpeed > 99) {
-    return 99;
-  }
-  if (currentSpeed > 10) {
-    return currentSpeed - 1;
-  }
-  return 0;
+  return constrain(currentSpeed - 10, 0, 100);
 }
 
 void handleHardwareButtons() {
